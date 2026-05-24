@@ -1,0 +1,42 @@
+{
+  "roi_prompt": [
+    2417,
+    1329,
+    2466,
+    1380
+  ],
+  "roi_minigame": [
+    897,
+    20,
+    1683,
+    168
+  ],
+  "template_threshold": 0.85,
+  "line_template_path": "templates/line.png",
+  "green_hsv_low": [
+    35,
+    100,
+    100
+  ],
+  "green_hsv_high": [
+    85,
+    255,
+    255
+  ],
+  "marker_hsv_low": [
+    20,
+    100,
+    100
+  ],
+  "marker_hsv_high": [
+    35,
+    255,
+    255
+  ],
+  "cast_cooldown": 2.0,
+  "bite_timeout": 30.0,
+  "reel_poll_rate": 0.008,
+  "result_delay": 2.5,
+  "deadzone_ratio": 0.12,
+  "min_error_to_tap": 3
+}

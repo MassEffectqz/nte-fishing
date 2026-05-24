@@ -1,0 +1,1007 @@
+import customtkinter as ctk
+import cv2
+import numpy as np
+import threading
+import time
+import os
+import tkinter as tk
+import ctypes
+import win32gui
+import win32con
+import pydirectinput
+import keyboard
+import random
+import logging
+from config import Config
+
+try:
+    import dxcam
+    _HAVE_DXCAM = True
+except ImportError:
+    _HAVE_DXCAM = False
+import mss
+
+# ==================== ЛОГГИРОВАНИЕ ====================
+# [УЛУЧШЕНИЕ 1] Логгирование в файл — при зависании или баге всё сохраняется
+logging.basicConfig(
+    filename="bot_log.txt",
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+pydirectinput.PAUSE = 0.01
+KEYEVENTF_KEYUP = 0x0002
+
+VK_KEY_F = 0x46
+VK_KEY_A = 0x41
+VK_KEY_D = 0x44
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# [УЛУЧШЕНИЕ 2] Пороги уверенности отдельно для каждого шаблона
+# zone — нужна высокая точность; marker — ниже порог, он часто частично перекрыт
+TEMPLATE_THRESHOLDS = {
+    "zone":   0.75,
+    "marker": 0.72,
+    "cast":   0.70,
+    "hook":   0.70,
+    "end":    0.72,
+}
+
+
+class NoActivateCTk(ctk.CTk):
+    """Окно, которое никогда не перехватывает фокус клавиатуры."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.after(10, self._apply_no_activate)
+
+    def _apply_no_activate(self):
+        try:
+            hwnd = int(self.wm_frame(), 16) if hasattr(self, 'wm_frame') else self.winfo_id()
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style | win32con.WS_EX_NOACTIVATE)
+        except Exception as e:
+            logging.warning(f"WS_EX_NOACTIVATE: {e}")
+
+
+class OverlayVisionApp:
+    def __init__(self):
+        # Захватываем hwnd ДО показа своего окна — иначе foreground = наш бот
+        self.game_hwnd = win32gui.GetForegroundWindow()
+        _game_title = win32gui.GetWindowText(self.game_hwnd) if self.game_hwnd else ""
+
+        self.root = NoActivateCTk()
+        self.root.title("NTE FISHING BY AEZQSM")
+        self.root.geometry("340x620+50+50")
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+
+        self.templates = {}
+        self.TEMPLATE_FOLDERS = ["cast", "hook", "marker", "zone", "end"]
+
+        # Один масштаб — достаточно при правильном downscale
+        self.TEMPLATE_SCALES = [1.0]
+
+        # Lock защищает toggle от одновременного вызова из UI и hotkey-потока
+        self._toggle_lock = threading.Lock()
+        self.is_running = False
+
+        # [УЛУЧШЕНИЕ 4] pynput синглтоны — создаём ОДИН РАЗ, не на каждый клик/нажатие
+        self._pynput_kb    = None
+        self._pynput_mouse = None
+        self._pynput_mouse_btn = None
+        try:
+            from pynput.keyboard import Controller as PynputKbCtrl
+            from pynput.mouse import Controller as PynputMouseCtrl, Button as PynputBtn
+            self._pynput_kb        = PynputKbCtrl()
+            self._pynput_mouse     = PynputMouseCtrl()
+            self._pynput_mouse_btn = PynputBtn
+        except ImportError:
+            pass
+
+        # состояние ввода
+        self._next_f_time         = 0
+        self._f_press_count       = 0
+        self._line_key_held       = False
+        self._current_line_key    = None
+        self._last_key_press_time = 0
+        self._last_zone_seen_time = 0
+        self.ZONE_TIMEOUT         = 0.3
+        self._next_end_click_time = 0
+        self._last_marker_box     = None
+        self._last_marker_seen_time = 0
+        self._draw_counter = 0
+        self._debug_confs = {}
+        self._debug_marker_zone_dist = 0
+        self._debug_marker_vel = 0.0
+
+        # [УЛУЧШЕНИЕ 5] Гистерезис — предотвращает дёрганье A/D на границе зоны (px)
+        self._hysteresis_px = 10
+
+        # [УЛУЧШЕНИЕ 6] Cooldown смены клавиши A→D и обратно — игра успевает обработать
+        self._key_switch_cooldown  = 0.055
+        self._last_key_switch_time = 0.0
+
+        # [УЛУЧШЕНИЕ 7] Трекинг скорости маркера — сокращает hold если маркер уже летит куда надо
+        self._marker_prev_center = None
+        self._marker_prev_time   = 0.0
+
+        # конфиг
+        self.cfg = Config()
+        self.cfg.load()
+        self.input_methods_names = ["pydirectinput", "ctypes (SendInput)", "pynput"]
+
+        # экран — dxcam (быстрее) или mss (fallback)
+        if _HAVE_DXCAM:
+            try:
+                self._cam = dxcam.create(output_color="BGR")
+                self.screen_w, self.screen_h = self._cam._resolution
+                self._use_dxcam = True
+            except Exception:
+                self._use_dxcam = False
+        else:
+            self._use_dxcam = False
+        if not self._use_dxcam:
+            with mss.mss() as sct_tmp:
+                self.monitor  = sct_tmp.monitors[1]
+                self.screen_w = sct_tmp.monitors[1]["width"]
+                self.screen_h = sct_tmp.monitors[1]["height"]
+
+        # детекция
+        self._last_zone_box = None
+        self.ROI_PADDING    = 100
+        self.DOWNSCALE      = 0.5
+
+        # ==================== UI ====================
+        ctk.CTkLabel(self.root, text="NTE FISHING BY AEZQSM",
+                     font=("Arial", 14, "bold")).pack(pady=(6, 2))
+
+        self.btn_load = ctk.CTkButton(self.root, text="📂 Загрузить шаблоны",
+                                       command=self.load_templates, height=26)
+        self.btn_load.pack(pady=1, padx=15, fill="x")
+
+        self.btn_toggle = ctk.CTkButton(
+            self.root, text="▶ ЗАПУСТИТЬ (F9)", command=self.toggle_vision,
+            fg_color="#2ea043", hover_color="#2c974b", height=36,
+            font=("Arial", 13, "bold")
+        )
+        self.btn_toggle.pack(pady=4, padx=15, fill="x")
+
+        self.auto_var = ctk.BooleanVar(value=self.cfg.auto_press_enabled)
+        ctk.CTkCheckBox(
+            self.root, text="Авто (F + A/D)",
+            variable=self.auto_var,
+            command=lambda: setattr(self.cfg, 'auto_press_enabled', self.auto_var.get())
+        ).pack(pady=1, padx=15, anchor="w")
+
+        # статус детекции
+        det_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        det_frame.pack(pady=1, padx=15, fill="x")
+        self.det_zone_label   = ctk.CTkLabel(det_frame, text="zone: ❌",
+                                              font=("Consolas", 10), text_color="gray")
+        self.det_marker_label = ctk.CTkLabel(det_frame, text="marker: ❌",
+                                              font=("Consolas", 10), text_color="gray")
+        self.det_cast_label   = ctk.CTkLabel(det_frame, text="cast/hook: ❌",
+                                              font=("Consolas", 10), text_color="gray")
+        self.det_end_label    = ctk.CTkLabel(det_frame, text="end: ❌",
+                                              font=("Consolas", 10), text_color="gray")
+        self.det_zone_label.pack(side="left", padx=(0, 4))
+        self.det_marker_label.pack(side="left", padx=(0, 4))
+        self.det_cast_label.pack(side="left", padx=(0, 4))
+        self.det_end_label.pack(side="left")
+
+        # F пауза + разброс
+        f_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        f_frame.pack(pady=1, padx=15, fill="x")
+        self.f_cd_label = ctk.CTkLabel(
+            f_frame, text=f"F: {self.cfg.f_cooldown:.2f}с ±{self.cfg.f_jitter:.2f}",
+            font=("Arial", 10))
+        self.f_cd_label.pack(anchor="w")
+        self.f_cd_slider = ctk.CTkSlider(f_frame, from_=0.10, to=2.0, number_of_steps=95,
+                                          command=self._on_f_cd_change, height=14)
+        self.f_cd_slider.set(self.cfg.f_cooldown)
+        self.f_cd_slider.pack(fill="x", pady=(1, 0))
+        self.f_jitter_slider = ctk.CTkSlider(f_frame, from_=0.0, to=1.0, number_of_steps=50,
+                                              command=self._on_f_jitter_change, height=14)
+        self.f_jitter_slider.set(self.cfg.f_jitter)
+        self.f_jitter_slider.pack(fill="x", pady=(1, 0))
+
+        # метод ввода + точность
+        row = ctk.CTkFrame(self.root, fg_color="transparent")
+        row.pack(pady=1, padx=15, fill="x")
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+        ctk.CTkLabel(row, text="Метод:", font=("Arial", 10)).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(row, text="Точность (глобал):", font=("Arial", 10)).grid(row=0, column=1, sticky="w")
+        self.method_menu = ctk.CTkOptionMenu(
+            row, values=self.input_methods_names,
+            command=self.on_method_change, height=24, font=("Arial", 10)
+        )
+        self.method_menu.set(self.input_methods_names[self.cfg.input_method])
+        self.method_menu.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.slider = ctk.CTkSlider(row, from_=0.5, to=0.99, number_of_steps=49,
+                                     command=self.update_threshold, height=14)
+        self.slider.set(self.cfg.threshold)
+        self.slider.grid(row=1, column=1, sticky="ew")
+
+        # Deadzone
+        dz_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        dz_frame.pack(pady=1, padx=15, fill="x")
+        self.dz_label = ctk.CTkLabel(dz_frame, text=f"Deadzone: {self.cfg.deadzone_ratio:.2f}",
+                                      font=("Arial", 10))
+        self.dz_label.pack(anchor="w")
+        self.dz_slider = ctk.CTkSlider(dz_frame, from_=0.05, to=0.5, number_of_steps=45,
+                                        command=self._on_dz_change, height=14)
+        self.dz_slider.set(self.cfg.deadzone_ratio)
+        self.dz_slider.pack(fill="x", pady=(1, 0))
+
+        self.btn_save = ctk.CTkButton(self.root, text="💾 Сохранить",
+                                       command=self._save_config, height=26,
+                                       fg_color="#555555", hover_color="#666666")
+        self.btn_save.pack(pady=3, padx=15, fill="x")
+
+        self.status = ctk.CTkLabel(self.root, text="Ожидание...",
+                                    text_color="gray", font=("Arial", 10))
+        self.status.pack(pady=(2, 1))
+
+        self.fps_label = ctk.CTkLabel(self.root, text="FPS: - | F:0 | AD:-",
+                                       text_color="gray", font=("Arial", 9))
+        self.fps_label.pack(pady=(0, 1))
+
+        # ==================== ДЕБАГ ====================
+        dbg = ctk.CTkFrame(self.root, fg_color="transparent")
+        dbg.pack(pady=0, padx=15, fill="x")
+
+        self.dbg_conf = ctk.CTkLabel(dbg, text="M:- Z:- C:- H:- E:-",
+                                      font=("Consolas", 9), text_color="gray", anchor="w")
+        self.dbg_conf.pack(fill="x")
+
+        self.dbg_zone_info = ctk.CTkLabel(dbg, text="zone: -px | dz: -",
+                                           font=("Consolas", 9), text_color="gray", anchor="w")
+        self.dbg_zone_info.pack(fill="x")
+
+        self.dbg_marker_info = ctk.CTkLabel(dbg, text="M-Z dist:- | vel:-",
+                                             font=("Consolas", 9), text_color="gray", anchor="w")
+        self.dbg_marker_info.pack(fill="x")
+
+        self.dbg_state = ctk.CTkLabel(dbg, text="ROI: - | state: -",
+                                       font=("Consolas", 9), text_color="gray", anchor="w")
+        self.dbg_state.pack(fill="x")
+
+        if _game_title:
+            self.status.configure(text=f"🎮 {_game_title[:30]}", text_color="cyan")
+
+        # ==================== ОВЕРЛЕЙ ====================
+        self.overlay = tk.Toplevel()
+        self.overlay.overrideredirect(True)
+        self.overlay.attributes("-topmost", True)
+        self.overlay.configure(bg="#010101")
+        self.overlay.wm_attributes("-transparentcolor", "#010101")
+        self.overlay.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        self.canvas = tk.Canvas(self.overlay, width=self.screen_w, height=self.screen_h,
+                                 bg="#010101", highlightthickness=0)
+        self.canvas.pack()
+        self.overlay.withdraw()
+
+        keyboard.add_hotkey("F9", self.toggle_vision, suppress=True)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(200, self.load_templates)
+
+        # перетаскивание окна за любое место
+        self._drag_data = {"x": 0, "y": 0}
+        self.root.bind("<Button-1>", self._drag_start)
+        self.root.bind("<B1-Motion>", self._drag_move)
+
+    # ==================== DRAG ====================
+
+    def _drag_start(self, event):
+        self._drag_data["x"] = event.x
+        self._drag_data["y"] = event.y
+
+    def _drag_move(self, event):
+        x = self.root.winfo_x() + event.x - self._drag_data["x"]
+        y = self.root.winfo_y() + event.y - self._drag_data["y"]
+        snap = 30
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        if x < snap:
+            x = 0
+        elif x + w > self.screen_w - snap:
+            x = self.screen_w - w
+        if y < snap:
+            y = 0
+        elif y + h > self.screen_h - snap:
+            y = self.screen_h - h
+        self.root.geometry(f"+{x}+{y}")
+
+    # ==================== SLIDER CALLBACKS ====================
+
+    def update_threshold(self, value):
+        self.cfg.threshold = round(value, 2)
+
+    def _on_f_cd_change(self, value):
+        self.cfg.f_cooldown = round(value, 2)
+        self.f_cd_label.configure(text=f"F: {self.cfg.f_cooldown:.2f}с ±{self.cfg.f_jitter:.2f}")
+
+    def _on_f_jitter_change(self, value):
+        self.cfg.f_jitter = round(value, 2)
+        self.f_cd_label.configure(text=f"F: {self.cfg.f_cooldown:.2f}с ±{self.cfg.f_jitter:.2f}")
+
+    def _on_dz_change(self, value):
+        self.cfg.deadzone_ratio = round(value, 2)
+        self.dz_label.configure(text=f"Deadzone: {self.cfg.deadzone_ratio:.2f}")
+
+    def on_method_change(self, value):
+        self.cfg.input_method = self.input_methods_names.index(value)
+
+    def _save_config(self):
+        if self.cfg.save():
+            self.status.configure(text="✅ Настройки сохранены", text_color="#2ea043")
+        else:
+            self.status.configure(text="❌ Ошибка сохранения", text_color="red")
+
+    # ==================== ШАБЛОНЫ ====================
+
+    def load_templates(self):
+        # [УЛУЧШЕНИЕ 9] Блокируем перезагрузку шаблонов во время работы — иначе data race
+        if self.is_running:
+            self.status.configure(text="⚠️ Нельзя во время работы!", text_color="orange")
+            return
+
+        loaded = 0
+        for name in self.TEMPLATE_FOLDERS:
+            folder   = f"templates/{name}"
+            old_path = f"templates/{name}.png"
+            variants = []
+
+            sources = []
+            if os.path.isdir(folder):
+                for fname in sorted(os.listdir(folder)):
+                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                        sources.append((os.path.join(folder, fname), fname))
+            if not sources and os.path.exists(old_path):
+                sources.append((old_path, f"{name}.png"))
+
+            for path, fname in sources:
+                img = cv2.imread(path)
+                if img is None:
+                    continue
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                # Цветовая маска на шаблон + скриншот (быстрее чем matchTemplate с mask)
+                if name == "marker":
+                    hsv_t = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                    mask_t = cv2.inRange(hsv_t, np.array([18, 150, 150]), np.array([38, 255, 255]))
+                    gray = cv2.bitwise_and(gray, gray, mask=mask_t)
+                elif name == "zone":
+                    hsv_t = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                    mask_t = cv2.inRange(hsv_t, np.array([70, 100, 100]), np.array([105, 255, 255]))
+                    gray = cv2.bitwise_and(gray, gray, mask=mask_t)
+                scales = {}
+                for s in self.TEMPLATE_SCALES:
+                    if s == 1.0:
+                        scales[s] = gray
+                    else:
+                        gh, gw = gray.shape
+                        nh = max(1, int(gh * s))
+                        nw = max(1, int(gw * s))
+                        scales[s] = cv2.resize(gray, (nw, nh))
+                # Предрасчёт DOWNSCALE версии — убирает cv2.resize каждый кадр
+                if self.DOWNSCALE != 1.0:
+                    gh, gw = gray.shape
+                    nh = max(1, int(gh * self.DOWNSCALE))
+                    nw = max(1, int(gw * self.DOWNSCALE))
+                    scales["ds"] = cv2.resize(gray, (nw, nh))
+                variants.append({"fname": fname, "scales": scales})
+
+            if variants:
+                self.templates[name] = {"variants": variants}
+                loaded += 1
+
+        color = "#2ea043" if loaded > 0 else "red"
+        text  = f"✅ Загружено {loaded}/{len(self.TEMPLATE_FOLDERS)}" if loaded > 0 else "❌ Шаблоны не найдены!"
+        self.status.configure(text=text, text_color=color)
+
+    # ==================== УПРАВЛЕНИЕ ====================
+
+    def toggle_vision(self):
+        # Lock предотвращает race condition между hotkey-потоком и UI-потоком
+        if not self._toggle_lock.acquire(blocking=False):
+            return
+        try:
+            if self.is_running:
+                self.is_running = False
+                self._release_all_keys()
+                self._last_zone_box      = None
+                self._last_marker_box    = None
+                self._marker_prev_center = None
+                self.btn_toggle.configure(text="▶ ЗАПУСТИТЬ (F9)", fg_color="#2ea043")
+                self.status.configure(text="Остановлено", text_color="yellow")
+                self.overlay.withdraw()
+            else:
+                if not self.templates:
+                    self.status.configure(text="⚠️ Нет шаблонов!", text_color="orange")
+                    return
+                self.is_running           = True
+                self._f_press_count       = 0
+                self._line_key_held       = False
+                self._current_line_key    = None
+                self._last_key_press_time = 0
+                self._last_zone_box       = None
+                self._last_marker_box     = None
+                self._marker_prev_center  = None
+                self._marker_prev_time    = 0.0
+                self._last_key_switch_time = 0.0
+                self.btn_toggle.configure(text="⏹ ОСТАНОВИТЬ (F9)", fg_color="#da3633")
+                self.status.configure(text="🔍 Сканирование...", text_color="cyan")
+                self.overlay.deiconify()
+                self.overlay.attributes("-topmost", True)
+                threading.Thread(target=self._vision_loop, daemon=True).start()
+        finally:
+            self._toggle_lock.release()
+
+    # ==================== СИСТЕМА ВВОДА ====================
+
+    def _get_vk_code(self, key_char):
+        return {'f': VK_KEY_F, 'a': VK_KEY_A, 'd': VK_KEY_D}.get(key_char.lower(), 0)
+
+    def _press_key(self, key_char):
+        vk = self._get_vk_code(key_char)
+        try:
+            if self.cfg.input_method == 0:
+                pydirectinput.press(key_char)
+            elif self.cfg.input_method == 1:
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                time.sleep(0.02)
+                ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            elif self.cfg.input_method == 2 and self._pynput_kb:
+                self._pynput_kb.press(key_char)
+                time.sleep(0.02)
+                self._pynput_kb.release(key_char)
+            return True
+        except Exception as e:
+            logging.warning(f"Press {key_char}: {e}")
+            return False
+
+    def _hold_key_down(self, key_char):
+        vk = self._get_vk_code(key_char)
+        try:
+            if self.cfg.input_method == 0:
+                pydirectinput.keyDown(key_char)
+            elif self.cfg.input_method == 1:
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+            elif self.cfg.input_method == 2 and self._pynput_kb:
+                self._pynput_kb.press(key_char)
+            return True
+        except Exception as e:
+            logging.warning(f"Hold {key_char}: {e}")
+            return False
+
+    def _release_key(self, key_char):
+        vk = self._get_vk_code(key_char)
+        try:
+            if self.cfg.input_method == 0:
+                pydirectinput.keyUp(key_char)
+            elif self.cfg.input_method == 1:
+                ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            elif self.cfg.input_method == 2 and self._pynput_kb:
+                self._pynput_kb.release(key_char)
+            return True
+        except Exception as e:
+            logging.warning(f"Release {key_char}: {e}")
+            return False
+
+    def _click_lmb(self):
+        try:
+            if self.cfg.input_method == 0:
+                pydirectinput.click()
+            elif self.cfg.input_method == 1:
+                ctypes.windll.user32.mouse_event(2, 0, 0, 0, 0)
+                time.sleep(0.02)
+                ctypes.windll.user32.mouse_event(4, 0, 0, 0, 0)
+            elif self.cfg.input_method == 2 and self._pynput_mouse:
+                # [УЛУЧШЕНИЕ 4] синглтон — не создаём MouseController на каждый клик
+                self._pynput_mouse.click(self._pynput_mouse_btn.left)
+            return True
+        except Exception as e:
+            logging.warning(f"LMB: {e}")
+            return False
+
+    def _release_all_keys(self):
+        if self._line_key_held and self._current_line_key:
+            self._release_key(self._current_line_key)
+        self._line_key_held    = False
+        self._current_line_key = None
+
+    # ==================== ЛОГИКА АВТОУПРАВЛЕНИЯ ====================
+
+    def _handle_cast_hook(self, detections):
+        active = [t for t in detections if t["name"] in ("cast", "hook")]
+        if not active:
+            return
+        now = time.time()
+        if now >= self._next_f_time:
+            if self._press_key('f'):
+                delay = self.cfg.f_cooldown + random.uniform(-self.cfg.f_jitter, self.cfg.f_jitter)
+                self._next_f_time = now + max(0.05, delay)
+                self._f_press_count += 1
+
+    def _handle_end(self, detections):
+        if not any(d["name"] == "end" for d in detections):
+            return
+        now = time.time()
+        if now >= self._next_end_click_time:
+            if self._click_lmb():
+                self._next_end_click_time = now + 1.0
+
+    def _handle_marker_zone(self, detections):
+        marker_list = [t for t in detections if t["name"] == "marker"]
+        zone_list   = [t for t in detections if t["name"] == "zone"]
+
+        if not marker_list or not zone_list:
+            if self._line_key_held:
+                self._release_all_keys()
+            # [УЛУЧШЕНИЕ 7] Сбрасываем историю скорости при потере маркера
+            self._marker_prev_center = None
+            return
+
+        # [УЛУЧШЕНИЕ 11] Берём лучший маркер и зону по confidence, а не первый попавшийся
+        best_marker = max(marker_list, key=lambda d: d["conf"])
+        best_zone   = max(zone_list,   key=lambda d: d["conf"])
+
+        mx1, _, mx2, _ = best_marker["box"]
+        marker_center  = (mx1 + mx2) // 2
+
+        zx1, _, zx2, _ = best_zone["box"]
+        zone_width  = zx2 - zx1
+        zone_center = (zx1 + zx2) // 2
+        safe_margin = int(zone_width * self.cfg.deadzone_ratio)
+        safe_left   = zx1 + safe_margin
+        safe_right  = zx2 - safe_margin
+
+        now = time.time()
+
+        # [УЛУЧШЕНИЕ 7] Считаем скорость маркера (px/сек)
+        marker_velocity = 0.0
+        if self._marker_prev_center is not None:
+            dt = now - self._marker_prev_time
+            if dt > 0.001:
+                marker_velocity = (marker_center - self._marker_prev_center) / dt
+        self._marker_prev_center = marker_center
+        self._marker_prev_time   = now
+        self._debug_marker_vel = marker_velocity
+
+        # [УЛУЧШЕНИЕ 5] Гистерезис — расширяем мёртвую зону в сторону текущей клавиши
+        hyst = self._hysteresis_px
+        needed_key = None
+        if marker_center < safe_left - hyst:
+            needed_key = 'd'
+        elif marker_center > safe_right + hyst:
+            needed_key = 'a'
+        elif self._line_key_held:
+            # Если уже держим клавишу — продолжаем до тех пор, пока не вышли за расширенную границу
+            if self._current_line_key == 'd' and marker_center < safe_left + hyst:
+                needed_key = 'd'
+            elif self._current_line_key == 'a' and marker_center > safe_right - hyst:
+                needed_key = 'a'
+
+        if needed_key is None:
+            if self._line_key_held:
+                self._release_all_keys()
+            return
+
+        # Время удержания клавиши пропорционально расстоянию от центра зоны
+        dist      = abs(marker_center - zone_center) / max(zone_width, 1)
+        hold_time = 0.08 + dist * 0.30  # от 0.08с (рядом) до 0.38с (далеко)
+
+        # [УЛУЧШЕНИЕ 7] Маркер уже летит в нужную сторону быстро — сокращаем hold
+        if needed_key == 'd' and marker_velocity > 60:   # px/с вправо — именно туда нам надо
+            hold_time *= 0.5
+        elif needed_key == 'a' and marker_velocity < -60:
+            hold_time *= 0.5
+
+        # Если уже держим ту же клавишу — отпускаем после hold_time
+        if self._line_key_held and self._current_line_key == needed_key:
+            if now - self._last_key_press_time > hold_time:
+                self._release_key(self._current_line_key)
+                self._line_key_held = False
+            return
+
+        # Смена клавиши: отпустить старую
+        if self._line_key_held:
+            self._release_key(self._current_line_key)
+            self._line_key_held = False
+            self._last_key_switch_time = now
+
+        # [УЛУЧШЕНИЕ 6] Cooldown смены — не зажимаем новую клавишу сразу после отпуска старой
+        if now - self._last_key_switch_time < self._key_switch_cooldown:
+            return
+
+        if self._hold_key_down(needed_key):
+            self._line_key_held       = True
+            self._current_line_key    = needed_key
+            self._last_key_press_time = now
+
+    def _process_input(self, detections):
+        if not self.cfg.auto_press_enabled:
+            if self._line_key_held:
+                self._release_all_keys()
+            return
+        if self._line_key_held and (time.time() - self._last_zone_seen_time > self.ZONE_TIMEOUT):
+            self._release_all_keys()
+        self._handle_cast_hook(detections)
+        self._handle_marker_zone(detections)
+        self._handle_end(detections)
+
+    # ==================== ЦИКЛ ЗРЕНИЯ ====================
+
+    def _vision_loop(self):
+        prev_time   = time.time()
+        frame_count = 0
+        # [УЛУЧШЕНИЕ 12] Консервативная начальная оценка FPS — ZONE_TIMEOUT мягче на старте
+        current_fps = 10.0
+
+        sct = None
+        if not self._use_dxcam:
+            sct = mss.mss()
+        try:
+            while self.is_running:
+                loop_start = time.time()
+
+                if self.game_hwnd and win32gui.IsIconic(self.game_hwnd):
+                    time.sleep(0.5)
+                    continue
+
+                try:
+                    if self._use_dxcam:
+                        raw = self._cam.grab()
+                        if raw is None:
+                            time.sleep(0.001)
+                            continue
+                        screenshot = raw.copy()
+                    else:
+                        raw = sct.grab(self.monitor)
+                        screenshot = np.array(raw)[:, :, :3]
+                    gray_screen = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
+                    hsv_screen  = cv2.cvtColor(screenshot, cv2.COLOR_BGR2HSV)
+                except Exception as e:
+                    logging.warning(f"Grab: {e}")
+                    time.sleep(0.1)
+                    continue
+
+                detections = []
+
+                try:
+                    ds = self.DOWNSCALE
+
+                    # Маски на ПОЛНОМ HSV (интерполяция при resize HSV ломает inRange)
+                    mask_marker_full = cv2.inRange(hsv_screen,
+                                                   np.array([18, 150, 150]),
+                                                   np.array([38, 255, 255]))
+                    mask_zone_full   = cv2.inRange(hsv_screen,
+                                                   np.array([70, 100, 100]),
+                                                   np.array([105, 255, 255]))
+
+                    if ds != 1.0:
+                        sh = int(gray_screen.shape[0] * ds)
+                        sw = int(gray_screen.shape[1] * ds)
+                        if sw < 1 or sh < 1:
+                            time.sleep(0.01)
+                            continue
+                        search_gray = cv2.resize(gray_screen, (sw, sh))
+                        # Ресайзим БИНАРНУЮ маску (INTER_NEAREST — без артефактов)
+                        mask_marker = cv2.resize(mask_marker_full, (sw, sh), interpolation=cv2.INTER_NEAREST)
+                        mask_zone   = cv2.resize(mask_zone_full,   (sw, sh), interpolation=cv2.INTER_NEAREST)
+                        search_gray_marker = cv2.bitwise_and(search_gray, search_gray, mask=mask_marker)
+                        search_gray_zone   = cv2.bitwise_and(search_gray, search_gray, mask=mask_zone)
+                    else:
+                        search_gray = gray_screen
+                        search_gray_marker = cv2.bitwise_and(gray_screen, gray_screen, mask=mask_marker_full)
+                        search_gray_zone   = cv2.bitwise_and(gray_screen, gray_screen, mask=mask_zone_full)
+
+                    def _get_search_layer(name):
+                        if name == "marker":
+                            return search_gray_marker
+                        if name == "zone":
+                            return search_gray_zone
+                        return search_gray
+
+                    # State-based skip: cast/hook не появляются во время minigame
+                    in_minigame = (self._last_marker_box is not None and self._last_zone_box is not None)
+
+                    for name, tpl in self.templates.items():
+                        if name in ("cast", "hook") and in_minigame:
+                            continue
+
+                        best_val, best_loc, best_size = 0.0, None, None
+
+                        base_layer = _get_search_layer(name)
+
+                        # ROI-оптимизация: если уже знаем где zone/marker — ищем только там
+                        roi_offset = (0, 0)
+                        if name == "zone" and self._last_zone_box is not None:
+                            zx1, zy1, zx2, zy2 = self._last_zone_box
+                            pad = self.ROI_PADDING
+                            rx1 = max(0, int(round(zx1 * ds)) - pad)
+                            ry1 = max(0, int(round(zy1 * ds)) - pad)
+                            rx2 = min(base_layer.shape[1], int(round(zx2 * ds)) + pad)
+                            ry2 = min(base_layer.shape[0], int(round(zy2 * ds)) + pad)
+                            search_patch = base_layer[ry1:ry2, rx1:rx2]
+                            roi_offset   = (rx1, ry1)
+                        elif name == "marker" and self._last_marker_box is not None:
+                            mx1, my1, mx2, my2 = self._last_marker_box
+                            pad = self.ROI_PADDING
+                            rx1 = max(0, int(round(mx1 * ds)) - pad)
+                            ry1 = max(0, int(round(my1 * ds)) - pad)
+                            rx2 = min(base_layer.shape[1], int(round(mx2 * ds)) + pad)
+                            ry2 = min(base_layer.shape[0], int(round(my2 * ds)) + pad)
+                            search_patch = base_layer[ry1:ry2, rx1:rx2]
+                            roi_offset   = (rx1, ry1)
+                        else:
+                            search_patch = base_layer
+
+                        for variant in tpl["variants"]:
+                            scaled_tpl = variant["scales"].get("ds")
+                            if scaled_tpl is None:
+                                scaled_tpl = variant["scales"].get(1.0)
+                                if scaled_tpl is None:
+                                    continue
+                                if ds != 1.0:
+                                    th = max(1, int(scaled_tpl.shape[0] * ds))
+                                    tw = max(1, int(scaled_tpl.shape[1] * ds))
+                                    scaled_tpl = cv2.resize(scaled_tpl, (tw, th))
+                            th, tw = scaled_tpl.shape[:2]
+                            if th > search_patch.shape[0] or tw > search_patch.shape[1]:
+                                continue
+                            result = cv2.matchTemplate(search_patch, scaled_tpl, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                            if max_val > best_val:
+                                best_val = max_val
+                                best_loc = (max_loc[0] + roi_offset[0], max_loc[1] + roi_offset[1])
+                                best_size = (th, tw)
+                            # Ранний выход: если уверенность > 0.90 — остальные варианты не нужны
+                            if best_val > 0.90:
+                                break
+
+                        # [УЛУЧШЕНИЕ 2] Per-template порог
+                        thr = TEMPLATE_THRESHOLDS.get(name, self.cfg.threshold)
+                        if best_val >= thr and best_loc is not None:
+                            th, tw = best_size
+                            inv = 1.0 / ds
+                            x1 = int(round(best_loc[0] * inv))
+                            y1 = int(round(best_loc[1] * inv))
+                            x2 = int(round((best_loc[0] + tw) * inv))
+                            y2 = int(round((best_loc[1] + th) * inv))
+                            detections.append({
+                                "name": name, "conf": best_val,
+                                "box": (x1, y1, x2, y2)
+                            })
+                except Exception as e:
+                    logging.warning(f"Template match error: {e}", exc_info=True)
+
+                # ---- Зона: трекинг через шаблон + ROI ----
+                try:
+                    self.ZONE_TIMEOUT = max(0.3, 3.0 / max(current_fps, 1.0))
+
+                    zone_dets = [d for d in detections if d["name"] == "zone"]
+                    if zone_dets:
+                        best_zone = max(zone_dets, key=lambda d: d["conf"])
+                        self._last_zone_box       = best_zone["box"]
+                        self._last_zone_seen_time = time.time()
+                    else:
+                        if self._last_zone_box is not None:
+                            if time.time() - self._last_zone_seen_time > self.ZONE_TIMEOUT:
+                                self._last_zone_box = None
+                except Exception as e:
+                    logging.warning(f"Zone: {e}")
+
+                # ---- Маркер: отсеиваем ложные срабатывания ----
+                try:
+                    marker_dets = [d for d in detections if d["name"] == "marker"]
+                    if marker_dets:
+                        best_marker = max(marker_dets, key=lambda d: d["conf"])
+                        mx1, my1, mx2, my2 = best_marker["box"]
+                        mc = (mx1 + mx2) // 2
+
+                        accept = False
+                        if self._last_marker_box is not None:
+                            lx1, ly1, lx2, ly2 = self._last_marker_box
+                            lc = (lx1 + lx2) // 2
+                            # [УЛУЧШЕНИЕ 13] Расширили фильтр 0.3 → 0.5 — меньше ложных блокировок
+                            if abs(mc - lc) < self.screen_w * 0.5:
+                                accept = True
+                        elif self._last_zone_box is not None:
+                            zx1, zy1, zx2, zy2 = self._last_zone_box
+                            zc = (zx1 + zx2) // 2
+                            if abs(mc - zc) < self.screen_w * 0.5:
+                                accept = True
+                        else:
+                            accept = True
+
+                        if accept:
+                            self._last_marker_box       = best_marker["box"]
+                            self._last_marker_seen_time = time.time()
+                        else:
+                            detections.remove(best_marker)
+                    else:
+                        if self._last_marker_box is not None:
+                            if time.time() - self._last_marker_seen_time > self.ZONE_TIMEOUT:
+                                self._last_marker_box = None
+                except Exception as e:
+                    logging.warning(f"Marker filter: {e}")
+
+                # ---- Сохраняем дебаг-данные ----
+                self._debug_confs = {d["name"]: d["conf"] for d in detections}
+                m_dets = [d for d in detections if d["name"] == "marker"]
+                z_dets = [d for d in detections if d["name"] == "zone"]
+                if m_dets and z_dets:
+                    mx = (m_dets[0]["box"][0] + m_dets[0]["box"][2]) // 2
+                    zx = (z_dets[0]["box"][0] + z_dets[0]["box"][2]) // 2
+                    self._debug_marker_zone_dist = abs(mx - zx)
+
+                try:
+                    self._process_input(detections)
+                except Exception as e:
+                    logging.warning(f"Input error: {e}", exc_info=True)
+                    self._release_all_keys()
+                    detections = []
+                self._draw_counter += 1
+                if self._draw_counter % 3 == 0:
+                    self.root.after(0, self._draw_overlay, detections.copy())
+
+                # ---- FPS + статус детекции ----
+                elapsed     = time.time() - loop_start
+                frame_count += 1
+                now          = time.time()
+                interval     = now - prev_time
+
+                if interval >= 1.0:
+                    current_fps = frame_count / interval
+                    prev_time   = now
+                    frame_count = 0
+
+                    has_zone   = any(d["name"] == "zone"           for d in detections)
+                    has_marker = any(d["name"] == "marker"         for d in detections)
+                    has_cast   = any(d["name"] in ("cast", "hook") for d in detections)
+                    has_end    = any(d["name"] == "end"            for d in detections)
+                    ad_status  = self._current_line_key.upper() if self._line_key_held else "-"
+
+                    # debug
+                    _confs = self._debug_confs
+                    _md = self._debug_marker_zone_dist
+                    _mv = self._debug_marker_vel
+                    in_mg = (self._last_marker_box is not None and self._last_zone_box is not None)
+                    roi_m = "M" if self._last_marker_box else "—"
+                    roi_z = "Z" if self._last_zone_box else "—"
+                    _zw = 0; _sm = 0
+                    if self._last_zone_box:
+                        _zw = self._last_zone_box[2] - self._last_zone_box[0]
+                        _sm = int(_zw * self.cfg.deadzone_ratio)
+
+                    def _update_ui(fps=current_fps, fc=self._f_press_count, ad=ad_status,
+                                   hz=has_zone, hm=has_marker, hc=has_cast, he=has_end,
+                                   ms=elapsed*1000, confs=_confs, dist=_md, vel=_mv,
+                                   roi_m=roi_m, roi_z=roi_z, mg=in_mg,
+                                   zw=_zw, sm=_sm):
+                        self.fps_label.configure(text=f"FPS: {fps:.1f} | F:{fc} | AD:{ad} | {ms:.0f}ms")
+                        self.det_zone_label.configure(
+                            text=f"zone: {'✅' if hz else '❌'}",
+                            text_color="#2ea043" if hz else "gray")
+                        self.det_marker_label.configure(
+                            text=f"marker: {'✅' if hm else '❌'}",
+                            text_color="#FFFF00" if hm else "gray")
+                        self.det_cast_label.configure(
+                            text=f"cast/hook: {'✅' if hc else '❌'}",
+                            text_color="#FFA500" if hc else "gray")
+                        self.det_end_label.configure(
+                            text=f"end: {'✅' if he else '❌'}",
+                            text_color="#FF69B4" if he else "gray")
+
+                        # debug labels
+                        m = f"{confs.get('marker',0):.0%}".replace("0%","-")
+                        z = f"{confs.get('zone',0):.0%}".replace("0%","-")
+                        c = f"{confs.get('cast',0):.0%}".replace("0%","-")
+                        h = f"{confs.get('hook',0):.0%}".replace("0%","-")
+                        e = f"{confs.get('end',0):.0%}".replace("0%","-")
+                        self.dbg_conf.configure(text=f"M:{m} Z:{z} C:{c} H:{h} E:{e}")
+                        self.dbg_marker_info.configure(text=f"M-Z:{dist}px | vel:{vel:.0f}px/s")
+                        self.dbg_zone_info.configure(text=f"zone: {zw}px | dz: {sm}px")
+                        self.dbg_state.configure(text=f"ROI:{roi_z}/{roi_m} | state:{'FISH' if mg else 'IDLE'}")
+
+                    self.root.after(0, _update_ui)
+
+                # Целевой FPS 30 — достаточно для рыбалки, не нагружает CPU
+                target_frame_time = 1.0 / 30.0
+                time.sleep(max(0.001, target_frame_time - elapsed))
+
+        finally:
+            if sct:
+                sct.close()
+        self._release_all_keys()
+        print("[INFO] Vision loop stopped")
+
+    # ==================== ОТРИСОВКА ====================
+
+    def _draw_overlay(self, detections):
+        self.canvas.delete("all")
+        colors = {
+            "cast": "#FFA500", "hook": "#00FF00",
+            "marker": "#FFFF00", "zone": "#00FF00"
+        }
+
+        for det in detections:
+            if det["name"] != "zone":
+                continue
+            x1, y1, x2, y2 = det["box"]
+            zw = x2 - x1
+            sm = int(zw * self.cfg.deadzone_ratio)
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00FF00", width=2)
+            self.canvas.create_rectangle(x1 + sm, y1, x2 - sm, y2,
+                                          outline="#006600", width=1, dash=(3, 3))
+            label = f"zone {det['conf']:.2f}"
+            tw = len(label) * 9 + 10
+            self.canvas.create_rectangle(x1, y1 - 28, x1 + tw, y1, fill="#00FF00", outline="")
+            self.canvas.create_text(x1 + 5, y1 - 14, text=label,
+                                     fill="black", anchor="w", font=("Consolas", 12, "bold"))
+
+        for det in detections:
+            if det["name"] == "zone":
+                continue
+            x1, y1, x2, y2 = det["box"]
+            color = colors.get(det["name"], "#FFFFFF")
+            width = 3 if self.cfg.auto_press_enabled else 2
+            self.canvas.create_rectangle(x1, y1, x2, y2, outline=color, width=width)
+            label = f"{det['name']} {det['conf']:.2f}"
+            if det["name"] == "marker" and self.cfg.auto_press_enabled and self._line_key_held:
+                label += f" [{self._current_line_key.upper()}]"
+            elif det["name"] in ("cast", "hook") and self.cfg.auto_press_enabled:
+                label += " [F]"
+            tw = len(label) * 9 + 10
+            self.canvas.create_rectangle(x1, y1 - 28, x1 + tw, y1, fill=color, outline="")
+            self.canvas.create_text(x1 + 5, y1 - 14, text=label,
+                                     fill="black", anchor="w", font=("Consolas", 12, "bold"))
+
+        # ---- Маркер ↔ Зона: линия связи + скорость ----
+        marker_det = next((d for d in detections if d["name"] == "marker"), None)
+        zone_det   = next((d for d in detections if d["name"] == "zone"), None)
+        if marker_det and zone_det:
+            mx1, _, mx2, _ = marker_det["box"]
+            zx1, _, zx2, _ = zone_det["box"]
+            my = (marker_det["box"][1] + marker_det["box"][3]) // 2
+            zy = (zone_det["box"][1] + zone_det["box"][3]) // 2
+            mc = (mx1 + mx2) // 2
+            zc = (zx1 + zx2) // 2
+            dist = abs(mc - zc)
+            # линия между центрами
+            self.canvas.create_line(mc, my, zc, zy, fill="#00FFFF", width=1, dash=(4, 4))
+            # дистанция
+            mid_x = (mc + zc) // 2
+            mid_y = (my + zy) // 2 - 12
+            self.canvas.create_text(mid_x, mid_y, text=f"{dist}px",
+                                     fill="#00FFFF", font=("Consolas", 9, "bold"))
+            # направление скорости (если есть)
+            vel = self._debug_marker_vel
+            if abs(vel) > 10:
+                arrow = "→" if vel > 0 else "←"
+                color = "#00FF00" if abs(vel) < 100 else "#FFAA00"
+                self.canvas.create_text(mx2 + 8, my, text=f"{arrow}{abs(vel):.0f}",
+                                         fill=color, font=("Consolas", 9, "bold"), anchor="w")
+
+    # ==================== ЗАВЕРШЕНИЕ ====================
+
+    def on_close(self):
+        self.cfg.save()
+        self.is_running = False
+        self._release_all_keys()
+        keyboard.unhook_all()
+        self.overlay.destroy()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    app = OverlayVisionApp()
+    app.run()

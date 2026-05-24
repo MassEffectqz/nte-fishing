@@ -1,0 +1,23 @@
+{
+  "threshold": 0.89,
+  "f_cooldown": 0.6,
+  "f_jitter": 0.64,
+  "input_method": 0,
+  "auto_press_enabled": true,
+  "deadzone_ratio": 0.39,
+  "catch_count": 0,
+  "center_deadzone_ratio": 0.08,
+  "prediction_time": 0.08,
+  "marker_hsv_low": [
+    20,
+    100,
+    100
+  ],
+  "marker_hsv_high": [
+    35,
+    255,
+    255
+  ],
+  "marker_hsv_trained": false,
+  "marker_samples_hsv": []
+}
